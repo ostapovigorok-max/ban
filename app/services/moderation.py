@@ -175,6 +175,10 @@ class ModerationService:
             )
         if clicker_id == punishment.user_id:
             return self._target_click_result(punishment)
+        if clicker_id != punishment.admin_id:
+            return CallbackResult(
+                kind=CallbackResultKind.ALERT, text=self._texts.callback_admin_only
+            )
         if not await self._is_administrator(chat_id, clicker_id):
             return CallbackResult(
                 kind=CallbackResultKind.ALERT, text=self._texts.callback_admin_only

@@ -6,6 +6,7 @@ import asyncio
 import sqlite3
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -25,7 +26,7 @@ from alembic import command
 from app.config.settings import Settings
 from app.database.base import Base
 from app.database.session import create_session_factory, create_sqlalchemy_engine
-from app.handlers.callbacks import _is_bot_start_url
+from app.handlers.callbacks import _answer_release_contact, _is_bot_start_url
 from app.keyboards.restriction import release_restriction_keyboard
 from app.keyboards.subscription import SubscriptionCallback, subscription_keyboard
 from app.models.punishment import PunishmentStatus
@@ -33,8 +34,9 @@ from app.models import GroupActivation, Punishment, Vote, VoteSession
 from app.repositories.punishments import PunishmentRepository
 from app.repositories.votes import VoteRepository
 from app.services.community_vote import CommunityVoteService
+from app.services.messages import TEXTS
 from app.services.moderation import ModerationService
-from app.services.types import ModerationRequest
+from app.services.types import CallbackResultKind, ModerationRequest
 from app.services.subscription import SubscriptionGateService
 from app.utils.telegram import is_chat_member_restricted
 from app.utils.time import utc_now
@@ -45,6 +47,13 @@ _ = (GroupActivation, Punishment, Vote, VoteSession)
 @dataclass(slots=True)
 class FakeMessage:
     message_id: int
+
+
+@dataclass(slots=True)
+class FakeCallbackAnswer:
+    url: str | None = None
+    text: str | None = None
+    show_alert: bool | None = None
 
 
 @dataclass(slots=True)
@@ -154,12 +163,13 @@ class FakeBot:
         *,
         chat_id: int,
         text: str,
-        reply_markup: InlineKeyboardMarkup,
+        reply_markup: InlineKeyboardMarkup | None = None,
         disable_web_page_preview: bool = True,
     ) -> FakeMessage:
         assert disable_web_page_preview is True
         assert text
-        assert reply_markup.inline_keyboard
+        if reply_markup is not None:
+            assert reply_markup.inline_keyboard
         self.sent_chat_ids.append(chat_id)
         self.next_message_id += 1
         return FakeMessage(self.next_message_id)
@@ -196,6 +206,22 @@ class FakeBot:
     async def delete_message(self, *, chat_id: int, message_id: int) -> None:
         assert chat_id
         assert message_id
+
+
+class FakeCallback:
+    def __init__(self) -> None:
+        self.answers: list[FakeCallbackAnswer] = []
+
+    async def answer(
+        self,
+        text: str | None = None,
+        *,
+        show_alert: bool = False,
+        url: str | None = None,
+    ) -> None:
+        self.answers.append(
+            FakeCallbackAnswer(url=url, text=text, show_alert=show_alert)
+        )
 
 
 def _make_moderation_request(*, chat_id: int, target_user_id: int) -> ModerationRequest:
@@ -293,6 +319,103 @@ def test_callback_redirect_rejects_admin_profile_url() -> None:
         url="https://t.me/moderation_bot?start=release",
         bot_username="moderation_bot",
     )
+
+
+def test_release_contact_redirects_to_admin_username_only() -> None:
+    async def run() -> None:
+        callback = FakeCallback()
+
+        await _answer_release_contact(
+            callback=callback,  # type: ignore[arg-type]
+            punishment_id=12,
+            admin_id=7,
+            admin_username="responsible_admin",
+        )
+
+        assert callback.answers == [
+            FakeCallbackAnswer(url="https://t.me/responsible_admin", show_alert=False)
+        ]
+
+    asyncio.run(run())
+
+
+def test_release_contact_without_admin_username_shows_alert() -> None:
+    async def run() -> None:
+        callback = FakeCallback()
+
+        await _answer_release_contact(
+            callback=callback,  # type: ignore[arg-type]
+            punishment_id=12,
+            admin_id=7,
+            admin_username=None,
+        )
+
+        assert callback.answers == [
+            FakeCallbackAnswer(
+                text=TEXTS.admin_contact_unavailable,
+                show_alert=True,
+            )
+        ]
+
+    asyncio.run(run())
+
+
+def test_only_punishing_admin_can_release_punishment(
+    tmp_path: Path,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = make_settings(tmp_path)
+    fake_bot = FakeBot()
+    chat_id = -100777
+    punished_user_id = 42
+    punishing_admin_id = 7
+    other_admin_id = 8
+    fake_bot.set_bot_moderation_permissions(chat_id=chat_id, allowed=True)
+    fake_bot.set_restricted(chat_id=chat_id, user_id=punished_user_id)
+    for admin_id in (punishing_admin_id, other_admin_id):
+        fake_bot.set_member(
+            chat_id=chat_id,
+            user_id=admin_id,
+            status=ChatMemberStatus.ADMINISTRATOR,
+        )
+
+    async def run() -> None:
+        async with session_factory() as session:
+            repo = PunishmentRepository(session)
+            punishment = await repo.create(
+                chat_id=chat_id,
+                user_id=punished_user_id,
+                admin_id=punishing_admin_id,
+                admin_username="responsible_admin",
+                admin_display_name="Admin",
+                user_display_name="Target",
+                expires_at=utc_now() + timedelta(days=1),
+            )
+            await session.commit()
+
+            service = ModerationService(
+                bot=fake_bot,  # type: ignore[arg-type]
+                session=session,
+                settings=settings,
+            )
+
+            other_result = await service.handle_release_click(
+                punishment_id=punishment.id,
+                chat_id=chat_id,
+                clicker_id=other_admin_id,
+            )
+            assert other_result.kind == CallbackResultKind.ALERT
+            assert len(fake_bot.restriction_calls) == 0
+
+            issuer_result = await service.handle_release_click(
+                punishment_id=punishment.id,
+                chat_id=chat_id,
+                clicker_id=punishing_admin_id,
+            )
+            assert issuer_result.kind == CallbackResultKind.ANSWER
+            assert fake_bot.restriction_calls == [(chat_id, punished_user_id, True)]
+
+    asyncio.run(run())
 
 
 def test_restriction_keyboard_uses_ukrainian_labels() -> None:

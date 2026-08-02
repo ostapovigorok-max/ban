@@ -15,6 +15,7 @@ from app.config.settings import Settings
 from app.keyboards.community_vote import CommunityVoteCallback
 from app.keyboards.restriction import RestrictionCallback
 from app.models.errors import ActivationRequiredError, ModerationError
+from app.repositories.punishments import PunishmentRepository
 from app.services.community_vote import CommunityVoteService
 from app.services.messages import TEXTS
 from app.services.moderation import ModerationService
@@ -40,6 +41,20 @@ async def release_restriction(
         await callback.answer(TEXTS.action_unavailable, show_alert=True)
         return
     async with session_factory() as session:
+        punishment = await PunishmentRepository(session).get_by_id(
+            callback_data.punishment_id
+        )
+        if punishment is None or punishment.chat_id != callback.message.chat.id:
+            await callback.answer(TEXTS.action_unavailable, show_alert=True)
+            return
+        if callback.from_user.id == punishment.user_id:
+            await _answer_release_contact(
+                callback=callback,
+                punishment_id=punishment.id,
+                admin_id=punishment.admin_id,
+                admin_username=punishment.admin_username,
+            )
+            return
         try:
             await SubscriptionGateService(
                 bot=bot, session=session, settings=settings
@@ -96,6 +111,27 @@ async def cast_community_vote(
         await callback.answer(result.alert, show_alert=True)
     else:
         await callback.answer()
+
+
+async def _answer_release_contact(
+    *,
+    callback: CallbackQuery,
+    punishment_id: int,
+    admin_id: int,
+    admin_username: str | None,
+) -> None:
+    logger.info(
+        "release_callback_contact_requested",
+        extra={
+            "punishment_id": punishment_id,
+            "admin_id": admin_id,
+            "admin_username": admin_username,
+        },
+    )
+    if admin_username:
+        await callback.answer(url=f"https://t.me/{admin_username}")
+        return
+    await callback.answer(TEXTS.admin_contact_unavailable, show_alert=True)
 
 
 async def _answer_release_url(
