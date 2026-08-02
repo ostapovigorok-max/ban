@@ -6,7 +6,7 @@ from html import escape
 
 
 def user_mention(*, user_id: int, display_name: str) -> str:
-    name = escape(display_name or "??????????", quote=True)
+    name = escape(display_name or "Користувач", quote=True)
     return f'<a href="tg://user?id={user_id}">{name}</a>'
 
 

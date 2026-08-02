@@ -13,7 +13,7 @@ class RestrictionCallback(CallbackData, prefix="restriction"):
 
 def rules_keyboard(rules_url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="?? ???????", url=rules_url)]]
+        inline_keyboard=[[InlineKeyboardButton(text="📖 Правила", url=rules_url)]]
     )
 
 
@@ -25,10 +25,10 @@ def release_restriction_keyboard(
     ).pack()
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="?? ???????", url=rules_url)],
+            [InlineKeyboardButton(text="📖 Правила", url=rules_url)],
             [
                 InlineKeyboardButton(
-                    text="?? ????? ?????????", callback_data=callback_data
+                    text="🔓 Зняти обмеження", callback_data=callback_data
                 )
             ],
         ]

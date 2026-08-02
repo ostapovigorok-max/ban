@@ -52,6 +52,10 @@ class PunishmentRepository:
         )
         return (await self._session.execute(statement)).scalar_one_or_none()
 
+    async def mark_status(self, punishment: Punishment, status: PunishmentStatus) -> None:
+        punishment.status = status
+        await self._session.flush()
+
     async def list_due(self, now: datetime) -> list[Punishment]:
         statement = select(Punishment).where(
             Punishment.status == PunishmentStatus.ACTIVE, Punishment.expires_at <= now

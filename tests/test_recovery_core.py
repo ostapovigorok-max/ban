@@ -9,18 +9,34 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from aiogram.types import InlineKeyboardMarkup
+from aiogram.enums import ChatMemberStatus, ChatType
+from aiogram.types import (
+    Chat,
+    ChatMemberRestricted,
+    ChatMemberUpdated,
+    InlineKeyboardMarkup,
+    User,
+)
 from alembic.config import Config
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from alembic import command
 from app.config.settings import Settings
 from app.database.base import Base
 from app.database.session import create_session_factory, create_sqlalchemy_engine
+from app.handlers.callbacks import _is_bot_start_url
+from app.keyboards.restriction import release_restriction_keyboard
 from app.keyboards.subscription import SubscriptionCallback, subscription_keyboard
+from app.models.punishment import PunishmentStatus
 from app.models import GroupActivation, Punishment, Vote, VoteSession
+from app.repositories.punishments import PunishmentRepository
 from app.repositories.votes import VoteRepository
+from app.services.community_vote import CommunityVoteService
+from app.services.moderation import ModerationService
+from app.services.types import ModerationRequest
 from app.services.subscription import SubscriptionGateService
+from app.utils.telegram import is_chat_member_restricted
 from app.utils.time import utc_now
 
 _ = (GroupActivation, Punishment, Vote, VoteSession)
@@ -31,12 +47,107 @@ class FakeMessage:
     message_id: int
 
 
+@dataclass(slots=True)
+class FakeChatMember:
+    status: ChatMemberStatus
+    can_delete_messages: bool = False
+    can_restrict_members: bool = False
+
+
+@dataclass(slots=True)
+class FakeUser:
+    id: int
+    username: str | None = None
+    full_name: str = "Test Bot"
+
+
 class FakeBot:
     def __init__(self) -> None:
         self.sent_chat_ids: list[int] = []
         self.edited_chat_ids: list[int] = []
         self.fail_edit = False
         self.next_message_id = 100
+        self.me = FakeUser(id=999, username="moderation_bot", full_name="Moderation Bot")
+        self.members: dict[tuple[int, int], FakeChatMember] = {}
+        self.moderation_permissions: dict[int, bool] = {}
+        self.restriction_calls: list[tuple[int, int, bool]] = []
+
+    def set_member(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        status: ChatMemberStatus,
+        can_delete_messages: bool = False,
+        can_restrict_members: bool = False,
+    ) -> None:
+        self.members[(chat_id, user_id)] = FakeChatMember(
+            status=status,
+            can_delete_messages=can_delete_messages,
+            can_restrict_members=can_restrict_members,
+        )
+
+    def set_restricted(
+        self, *, chat_id: int, user_id: int, restricted: bool = True
+    ) -> None:
+        if restricted:
+            self.set_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                status=ChatMemberStatus.RESTRICTED,
+            )
+        else:
+            self.set_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                status=ChatMemberStatus.MEMBER,
+            )
+
+    def set_bot_moderation_permissions(self, *, chat_id: int, allowed: bool) -> None:
+        self.moderation_permissions[chat_id] = allowed
+
+    async def get_me(self) -> FakeUser:
+        return self.me
+
+    async def get_chat_member(self, chat_id: int, user_id: int) -> FakeChatMember:
+        if user_id == self.me.id:
+            if not self.moderation_permissions.get(chat_id, True):
+                return FakeChatMember(
+                    status=ChatMemberStatus.ADMINISTRATOR,
+                    can_delete_messages=False,
+                    can_restrict_members=False,
+                )
+            return FakeChatMember(
+                status=ChatMemberStatus.ADMINISTRATOR,
+                can_delete_messages=True,
+                can_restrict_members=True,
+            )
+        return self.members.get(
+            (chat_id, user_id), FakeChatMember(status=ChatMemberStatus.MEMBER)
+        )
+
+    async def restrict_chat_member(
+        self,
+        *,
+        chat_id: int,
+        user_id: int,
+        permissions,
+        until_date=None,
+        use_independent_chat_permissions: bool | None = None,
+    ) -> None:
+        self.restriction_calls.append((chat_id, user_id, permissions.can_send_messages))
+        if permissions.can_send_messages:
+            self.set_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                status=ChatMemberStatus.MEMBER,
+            )
+        else:
+            self.set_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                status=ChatMemberStatus.RESTRICTED,
+            )
 
     async def send_message(
         self,
@@ -44,7 +155,7 @@ class FakeBot:
         chat_id: int,
         text: str,
         reply_markup: InlineKeyboardMarkup,
-        disable_web_page_preview: bool,
+        disable_web_page_preview: bool = True,
     ) -> FakeMessage:
         assert disable_web_page_preview is True
         assert text
@@ -59,16 +170,70 @@ class FakeBot:
         chat_id: int,
         message_id: int,
         text: str,
-        reply_markup: InlineKeyboardMarkup,
-        disable_web_page_preview: bool,
+        reply_markup: InlineKeyboardMarkup | None,
+        disable_web_page_preview: bool = True,
     ) -> None:
         assert message_id
         assert text
-        assert reply_markup.inline_keyboard
+        if reply_markup is not None:
+            assert reply_markup.inline_keyboard
         assert disable_web_page_preview is True
         self.edited_chat_ids.append(chat_id)
         if self.fail_edit:
             raise RuntimeError("message is gone")
+
+    async def edit_message_reply_markup(
+        self,
+        *,
+        chat_id: int,
+        message_id: int,
+        reply_markup: InlineKeyboardMarkup | None,
+    ) -> None:
+        assert chat_id
+        assert message_id
+        self.edited_chat_ids.append(chat_id)
+
+    async def delete_message(self, *, chat_id: int, message_id: int) -> None:
+        assert chat_id
+        assert message_id
+
+
+def _make_moderation_request(*, chat_id: int, target_user_id: int) -> ModerationRequest:
+    return ModerationRequest(
+        chat_id=chat_id,
+        command_message_id=10,
+        offending_message_id=11,
+        admin_id=1,
+        admin_username="admin",
+        admin_display_name="Admin",
+        target_user_id=target_user_id,
+        target_display_name="Target",
+    )
+
+
+def _make_restricted_member(*, can_send_messages: bool) -> ChatMemberRestricted:
+    return ChatMemberRestricted(
+        status=ChatMemberStatus.RESTRICTED,
+        user=User(id=42, is_bot=False, first_name="Target"),
+        is_member=True,
+        can_send_messages=can_send_messages,
+        can_send_audios=can_send_messages,
+        can_send_documents=can_send_messages,
+        can_send_photos=can_send_messages,
+        can_send_videos=can_send_messages,
+        can_send_video_notes=can_send_messages,
+        can_send_voice_notes=can_send_messages,
+        can_send_polls=can_send_messages,
+        can_send_other_messages=can_send_messages,
+        can_add_web_page_previews=can_send_messages,
+        can_react_to_messages=True,
+        can_edit_tag=True,
+        can_change_info=True,
+        can_invite_users=True,
+        can_pin_messages=True,
+        can_manage_topics=True,
+        until_date=utc_now(),
+    )
 
 
 def make_settings(tmp_path: Path) -> Settings:
@@ -113,6 +278,70 @@ def test_subscription_keyboard_contains_links_and_callback() -> None:
     unpacked = SubscriptionCallback.unpack(callback_data)
     assert unpacked.chat_id == -100777
     assert unpacked.action == "verify"
+
+
+def test_callback_redirect_rejects_admin_profile_url() -> None:
+    assert not _is_bot_start_url(
+        url="https://t.me/responsible_admin",
+        bot_username="moderation_bot",
+    )
+    assert not _is_bot_start_url(
+        url=None,
+        bot_username="moderation_bot",
+    )
+    assert _is_bot_start_url(
+        url="https://t.me/moderation_bot?start=release",
+        bot_username="moderation_bot",
+    )
+
+
+def test_restriction_keyboard_uses_ukrainian_labels() -> None:
+    keyboard = release_restriction_keyboard(
+        12,
+        rules_url="https://example.test/rules",
+    )
+
+    assert keyboard.inline_keyboard[0][0].text == "📖 Правила"
+    assert keyboard.inline_keyboard[1][0].text == "🔓 Зняти обмеження"
+
+
+def test_chat_member_updated_manual_unrestrict_is_not_active_punishment() -> None:
+    restricted = _make_restricted_member(can_send_messages=False)
+    restored = _make_restricted_member(can_send_messages=True)
+    partial = ChatMemberRestricted(
+        status=ChatMemberStatus.RESTRICTED,
+        user=User(id=42, is_bot=False, first_name="Target"),
+        is_member=True,
+        can_send_messages=True,
+        can_send_audios=True,
+        can_send_documents=False,
+        can_send_photos=True,
+        can_send_videos=True,
+        can_send_video_notes=True,
+        can_send_voice_notes=True,
+        can_send_polls=True,
+        can_send_other_messages=True,
+        can_add_web_page_previews=True,
+        can_react_to_messages=True,
+        can_edit_tag=True,
+        can_change_info=True,
+        can_invite_users=True,
+        can_pin_messages=True,
+        can_manage_topics=True,
+        until_date=utc_now(),
+    )
+
+    update = ChatMemberUpdated(
+        chat=Chat(id=-100777, type=ChatType.SUPERGROUP, title="Test"),
+        from_user=User(id=7, is_bot=False, first_name="Admin"),
+        date=utc_now(),
+        old_chat_member=restricted,
+        new_chat_member=restored,
+    )
+
+    assert is_chat_member_restricted(update.old_chat_member)
+    assert not is_chat_member_restricted(update.new_chat_member)
+    assert is_chat_member_restricted(partial)
 
 
 def test_settings_reject_invite_link_for_required_ids(tmp_path: Path) -> None:
@@ -170,6 +399,108 @@ def test_vote_unique_constraint(
             )
             assert await repo.add_vote(session_id=vote_session.id, voter_user_id=10)
             assert not await repo.add_vote(session_id=vote_session.id, voter_user_id=10)
+
+    asyncio.run(run())
+
+
+def test_stale_punishment_is_reconciled_before_ban_and_vote_creation(
+    tmp_path: Path,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    settings = make_settings(tmp_path)
+    fake_bot = FakeBot()
+    chat_id = -100777
+    user_id = 42
+    admin_id = 7
+    fake_bot.set_bot_moderation_permissions(chat_id=chat_id, allowed=True)
+    fake_bot.set_restricted(chat_id=chat_id, user_id=user_id, restricted=False)
+    fake_bot.set_member(
+        chat_id=chat_id,
+        user_id=admin_id,
+        status=ChatMemberStatus.ADMINISTRATOR,
+    )
+
+    async def run() -> None:
+        async with session_factory() as session:
+            session.add(
+                GroupActivation(
+                    chat_id=chat_id,
+                    is_active=True,
+                    activating_admin_id=admin_id,
+                    activating_admin_name="Admin",
+                )
+            )
+            await session.commit()
+
+            moderation = ModerationService(
+                bot=fake_bot,  # type: ignore[arg-type]
+                session=session,
+                settings=settings,
+            )
+            votes = CommunityVoteService(
+                bot=fake_bot,  # type: ignore[arg-type]
+                session=session,
+                settings=settings,
+            )
+
+            request = _make_moderation_request(chat_id=chat_id, target_user_id=user_id)
+            request = ModerationRequest(
+                chat_id=request.chat_id,
+                command_message_id=request.command_message_id,
+                offending_message_id=request.offending_message_id,
+                admin_id=admin_id,
+                admin_username=request.admin_username,
+                admin_display_name=request.admin_display_name,
+                target_user_id=request.target_user_id,
+                target_display_name=request.target_display_name,
+            )
+
+            first_punishment = await moderation.apply_restriction(request)
+            assert first_punishment.status == PunishmentStatus.ACTIVE
+
+            fake_bot.set_restricted(chat_id=chat_id, user_id=user_id, restricted=False)
+
+            second_punishment = await moderation.apply_restriction(request)
+            assert second_punishment.id != first_punishment.id
+            assert second_punishment.status == PunishmentStatus.ACTIVE
+
+            repo = PunishmentRepository(session)
+            active = await repo.get_active_for_user(chat_id=chat_id, user_id=user_id)
+            assert active is not None
+            assert active.id == second_punishment.id
+
+            punishments = (
+                await session.execute(
+                    select(Punishment).where(
+                        Punishment.chat_id == chat_id,
+                        Punishment.user_id == user_id,
+                    )
+                )
+            ).scalars().all()
+            assert len(punishments) == 2
+            assert {p.status for p in punishments} == {
+                PunishmentStatus.EXPIRED,
+                PunishmentStatus.ACTIVE,
+            }
+
+            fake_bot.set_restricted(chat_id=chat_id, user_id=user_id, restricted=False)
+
+            vote_session = await votes.start_vote(request)
+            assert vote_session.offender_user_id == user_id
+
+            refreshed = await repo.get_active_for_user(chat_id=chat_id, user_id=user_id)
+            assert refreshed is None
+
+            punishments = (
+                await session.execute(
+                    select(Punishment).where(
+                        Punishment.chat_id == chat_id,
+                        Punishment.user_id == user_id,
+                    )
+                )
+            ).scalars().all()
+            assert [p.status for p in punishments].count(PunishmentStatus.EXPIRED) == 2
+            assert all(p.status != PunishmentStatus.ACTIVE for p in punishments)
 
     asyncio.run(run())
 

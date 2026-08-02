@@ -17,7 +17,6 @@ from app.config.settings import Settings
 from app.keyboards.community_vote import community_vote_keyboard
 from app.models.errors import ActivationRequiredError, ModerationError
 from app.models.vote import VoteSession, VoteSessionStatus
-from app.repositories.punishments import PunishmentRepository
 from app.repositories.votes import VoteRepository
 from app.services.messages import TEXTS, ModerationTexts
 from app.services.moderation import ModerationService
@@ -158,10 +157,9 @@ class CommunityVoteService:
             return False
         if not await self._ensure_group_active(vote_session.chat_id):
             return False
-        existing = await PunishmentRepository(self._session).get_active_for_user(
-            chat_id=vote_session.chat_id, user_id=vote_session.offender_user_id
-        )
-        if existing is None:
+        if not await self._moderation.reconcile_active_punishment(
+            vote_session.chat_id, vote_session.offender_user_id
+        ):
             await self._moderation.apply_restriction(
                 ModerationRequest(
                     chat_id=vote_session.chat_id,

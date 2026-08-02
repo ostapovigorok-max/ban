@@ -17,7 +17,7 @@ def community_vote_keyboard(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=f"?? ?????????? ({votes_count}/{votes_required})",
+                    text=f"👍 Голосувати ({votes_count}/{votes_required})",
                     callback_data=CommunityVoteCallback(token=callback_token).pack(),
                 )
             ]

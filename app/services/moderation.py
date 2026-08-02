@@ -27,6 +27,7 @@ from app.utils.locks import KeyedLockRegistry
 from app.utils.telegram import (
     has_moderation_permissions,
     is_chat_administrator,
+    is_chat_member_restricted,
     muted_permissions,
     unrestricted_permissions,
 )
@@ -64,7 +65,18 @@ class ModerationService:
         await self._ensure_target_is_not_administrator(
             request.chat_id, request.target_user_id
         )
-        await self._ensure_no_active_punishment(request.chat_id, request.target_user_id)
+        if await self.reconcile_active_punishment(
+            request.chat_id, request.target_user_id
+        ):
+            raise ModerationError(self._texts.user_already_restricted)
+        logger.info(
+            "creating_new_punishment",
+            extra={
+                "chat_id": request.chat_id,
+                "target_user_id": request.target_user_id,
+                "admin_id": request.admin_id,
+            },
+        )
         expires_at = utc_now() + timedelta(days=self._settings.restriction_days)
         try:
             await self._bot.delete_message(
@@ -133,7 +145,8 @@ class ModerationService:
     ) -> None:
         await self._ensure_bot_permissions(chat_id)
         await self._ensure_target_is_not_administrator(chat_id, target_user_id)
-        await self._ensure_no_active_punishment(chat_id, target_user_id)
+        if await self.reconcile_active_punishment(chat_id, target_user_id):
+            raise ModerationError(self._texts.user_already_restricted)
 
     async def handle_release_click(
         self, *, punishment_id: int, chat_id: int, clicker_id: int
@@ -193,6 +206,59 @@ class ModerationService:
     async def expire_punishment(self, punishment: Punishment) -> bool:
         return await self._release_punishment(punishment, PunishmentStatus.EXPIRED)
 
+    async def reconcile_active_punishment(self, chat_id: int, user_id: int) -> bool:
+        existing = await self._repository.get_active_for_user(
+            chat_id=chat_id, user_id=user_id
+        )
+        if existing is None:
+            return False
+        if as_utc(existing.expires_at) <= utc_now():
+            await self.expire_punishment_by_id(existing.id)
+            return False
+        try:
+            member = await self._bot.get_chat_member(chat_id, user_id)
+        except TelegramAPIError as exc:
+            logger.warning(
+                "active_punishment_verification_failed",
+                extra={
+                    "punishment_id": existing.id,
+                    "chat_id": chat_id,
+                    "user_id": user_id,
+                    "error": str(exc),
+                },
+                exc_info=True,
+            )
+            return True
+        logger.info(
+            "telegram_member_status",
+            extra={
+                "status": getattr(member, "status", None),
+                "punishment_id": existing.id,
+                "user_id": user_id,
+            },
+        )
+        if is_chat_member_restricted(member):
+            return True
+        logger.info(
+            "stale_active_punishment_detected",
+            extra={
+                "punishment_id": existing.id,
+                "chat_id": chat_id,
+                "user_id": user_id,
+            },
+        )
+        await self._repository.mark_status(existing, PunishmentStatus.EXPIRED)
+        await self._session.commit()
+        logger.info(
+            "stale_active_punishment_resolved",
+            extra={
+                "punishment_id": existing.id,
+                "chat_id": chat_id,
+                "user_id": user_id,
+            },
+        )
+        return False
+
     async def _ensure_moderator(self, chat_id: int, admin_id: int) -> None:
         if not await self._is_administrator(chat_id, admin_id):
             raise ModerationError(self._texts.admin_required)
@@ -212,13 +278,7 @@ class ModerationService:
             raise ModerationError(self._texts.target_is_administrator)
 
     async def _ensure_no_active_punishment(self, chat_id: int, user_id: int) -> None:
-        existing = await self._repository.get_active_for_user(
-            chat_id=chat_id, user_id=user_id
-        )
-        if existing is not None:
-            if as_utc(existing.expires_at) <= utc_now():
-                await self.expire_punishment_by_id(existing.id)
-                return
+        if await self.reconcile_active_punishment(chat_id, user_id):
             raise ModerationError(self._texts.user_already_restricted)
 
     async def _is_administrator(self, chat_id: int, user_id: int) -> bool:

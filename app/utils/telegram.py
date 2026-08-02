@@ -35,6 +35,24 @@ def is_subscription_member(member: ChatMember) -> bool:
     }
 
 
+def is_chat_member_restricted(member: ChatMember) -> bool:
+    if getattr(member, "status", None) != ChatMemberStatus.RESTRICTED:
+        return False
+
+    return not (
+        getattr(member, "can_send_messages", False)
+        and getattr(member, "can_send_audios", False)
+        and getattr(member, "can_send_documents", False)
+        and getattr(member, "can_send_photos", False)
+        and getattr(member, "can_send_videos", False)
+        and getattr(member, "can_send_video_notes", False)
+        and getattr(member, "can_send_voice_notes", False)
+        and getattr(member, "can_send_polls", False)
+        and getattr(member, "can_send_other_messages", False)
+        and getattr(member, "can_add_web_page_previews", False)
+    )
+
+
 async def is_chat_administrator(bot: Bot, chat_id: int, user_id: int) -> bool:
     member = await bot.get_chat_member(chat_id, user_id)
     status = getattr(member, "status", None)
