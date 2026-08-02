@@ -1,0 +1,41 @@
+[project]
+name = "telegram-moderation-bot"
+version = "1.0.0"
+description = "Production Telegram moderation bot"
+requires-python = ">=3.12"
+dependencies = [
+  "aiogram>=3.29,<4",
+  "SQLAlchemy[asyncio]>=2.0,<3",
+  "aiosqlite>=0.20",
+  "alembic>=1.13",
+  "pydantic>=2.8",
+  "pydantic-settings>=2.4",
+  "APScheduler>=3.10",
+  "python-dotenv>=1.0",
+]
+
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "C4", "SIM"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_return_any = true
+plugins = ["sqlalchemy.ext.mypy.plugin"]
+
+[[tool.mypy.overrides]]
+module = ["apscheduler.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
