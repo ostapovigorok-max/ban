@@ -26,7 +26,7 @@ from alembic import command
 from app.config.settings import Settings
 from app.database.base import Base
 from app.database.session import create_session_factory, create_sqlalchemy_engine
-from app.handlers.callbacks import _answer_release_contact, _is_bot_start_url
+from app.handlers.callbacks import CONTACT_ADMIN_BUTTON_TEXT, _show_release_contact_button
 from app.keyboards.restriction import release_restriction_keyboard
 from app.keyboards.subscription import SubscriptionCallback, subscription_keyboard
 from app.models.punishment import PunishmentStatus
@@ -80,6 +80,9 @@ class FakeBot:
         self.members: dict[tuple[int, int], FakeChatMember] = {}
         self.moderation_permissions: dict[int, bool] = {}
         self.restriction_calls: list[tuple[int, int, bool]] = []
+        self.edited_reply_markups: list[
+            tuple[int, int, InlineKeyboardMarkup | None]
+        ] = []
 
     def set_member(
         self,
@@ -202,6 +205,7 @@ class FakeBot:
         assert chat_id
         assert message_id
         self.edited_chat_ids.append(chat_id)
+        self.edited_reply_markups.append((chat_id, message_id, reply_markup))
 
     async def delete_message(self, *, chat_id: int, message_id: int) -> None:
         assert chat_id
@@ -219,6 +223,7 @@ class FakeCallback:
         show_alert: bool = False,
         url: str | None = None,
     ) -> None:
+        assert url is None
         self.answers.append(
             FakeCallbackAnswer(url=url, text=text, show_alert=show_alert)
         )
@@ -306,50 +311,54 @@ def test_subscription_keyboard_contains_links_and_callback() -> None:
     assert unpacked.action == "verify"
 
 
-def test_callback_redirect_rejects_admin_profile_url() -> None:
-    assert not _is_bot_start_url(
-        url="https://t.me/responsible_admin",
-        bot_username="moderation_bot",
-    )
-    assert not _is_bot_start_url(
-        url=None,
-        bot_username="moderation_bot",
-    )
-    assert _is_bot_start_url(
-        url="https://t.me/moderation_bot?start=release",
-        bot_username="moderation_bot",
-    )
+def test_callback_answer_url_is_never_used() -> None:
+    assert "callback.answer(url=" not in Path("app/handlers/callbacks.py").read_text()
 
 
-def test_release_contact_redirects_to_admin_username_only() -> None:
+def test_release_contact_edits_admin_profile_button_without_callback_url() -> None:
     async def run() -> None:
+        fake_bot = FakeBot()
         callback = FakeCallback()
 
-        await _answer_release_contact(
+        await _show_release_contact_button(
             callback=callback,  # type: ignore[arg-type]
+            bot=fake_bot,  # type: ignore[arg-type]
             punishment_id=12,
+            chat_id=-100777,
+            message_id=55,
             admin_id=7,
             admin_username="responsible_admin",
         )
 
-        assert callback.answers == [
-            FakeCallbackAnswer(url="https://t.me/responsible_admin", show_alert=False)
-        ]
+        assert callback.answers == [FakeCallbackAnswer(show_alert=False)]
+        assert len(fake_bot.edited_reply_markups) == 1
+        chat_id, message_id, markup = fake_bot.edited_reply_markups[0]
+        assert chat_id == -100777
+        assert message_id == 55
+        assert markup is not None
+        button = markup.inline_keyboard[0][0]
+        assert button.text == CONTACT_ADMIN_BUTTON_TEXT
+        assert button.url == "https://t.me/responsible_admin"
 
     asyncio.run(run())
 
 
 def test_release_contact_without_admin_username_shows_alert() -> None:
     async def run() -> None:
+        fake_bot = FakeBot()
         callback = FakeCallback()
 
-        await _answer_release_contact(
+        await _show_release_contact_button(
             callback=callback,  # type: ignore[arg-type]
+            bot=fake_bot,  # type: ignore[arg-type]
             punishment_id=12,
+            chat_id=-100777,
+            message_id=55,
             admin_id=7,
             admin_username=None,
         )
 
+        assert fake_bot.edited_reply_markups == []
         assert callback.answers == [
             FakeCallbackAnswer(
                 text=TEXTS.admin_contact_unavailable,
@@ -398,6 +407,15 @@ def test_only_punishing_admin_can_release_punishment(
                 session=session,
                 settings=settings,
             )
+
+            target_result = await service.handle_release_click(
+                punishment_id=punishment.id,
+                chat_id=chat_id,
+                clicker_id=punished_user_id,
+            )
+            assert target_result.kind == CallbackResultKind.ALERT
+            assert len(fake_bot.restriction_calls) == 0
+            assert fake_bot.sent_chat_ids == []
 
             other_result = await service.handle_release_click(
                 punishment_id=punishment.id,

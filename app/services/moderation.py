@@ -174,7 +174,9 @@ class ModerationService:
                 kind=CallbackResultKind.ALERT, text=self._texts.action_unavailable
             )
         if clicker_id == punishment.user_id:
-            return self._target_click_result(punishment)
+            return CallbackResult(
+                kind=CallbackResultKind.ALERT, text=self._texts.action_unavailable
+            )
         if clicker_id != punishment.admin_id:
             return CallbackResult(
                 kind=CallbackResultKind.ALERT, text=self._texts.callback_admin_only
@@ -315,16 +317,6 @@ class ModerationService:
                 exc_info=True,
             )
             return None
-
-    def _target_click_result(self, punishment: Punishment) -> CallbackResult:
-        if punishment.admin_username:
-            return CallbackResult(
-                kind=CallbackResultKind.URL,
-                url=f"https://t.me/{punishment.admin_username}",
-            )
-        return CallbackResult(
-            kind=CallbackResultKind.ALERT, text=self._texts.admin_contact_unavailable
-        )
 
     async def _release_punishment(
         self, punishment: Punishment, status: PunishmentStatus

@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import logging
-from urllib.parse import parse_qs, urlparse
 
 from aiogram import Bot, F, Router
 from aiogram.enums import ChatType
-from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.types import CallbackQuery
+from aiogram.exceptions import TelegramAPIError
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.config.settings import Settings
@@ -21,6 +20,8 @@ from app.services.messages import TEXTS
 from app.services.moderation import ModerationService
 from app.services.subscription import SubscriptionGateService
 from app.services.types import CallbackResultKind
+
+CONTACT_ADMIN_BUTTON_TEXT = "✉️ Написати адміністратору"
 
 router = Router(name=__name__)
 logger = logging.getLogger(__name__)
@@ -48,9 +49,12 @@ async def release_restriction(
             await callback.answer(TEXTS.action_unavailable, show_alert=True)
             return
         if callback.from_user.id == punishment.user_id:
-            await _answer_release_contact(
+            await _show_release_contact_button(
                 callback=callback,
+                bot=bot,
                 punishment_id=punishment.id,
+                chat_id=punishment.chat_id,
+                message_id=callback.message.message_id,
                 admin_id=punishment.admin_id,
                 admin_username=punishment.admin_username,
             )
@@ -78,13 +82,6 @@ async def release_restriction(
             return
     if result.kind == CallbackResultKind.ALERT:
         await callback.answer(result.text, show_alert=True)
-    elif result.kind == CallbackResultKind.URL:
-        await _answer_release_url(
-            callback=callback,
-            bot=bot,
-            punishment_id=callback_data.punishment_id,
-            url=result.url,
-        )
     else:
         await callback.answer()
 
@@ -113,10 +110,13 @@ async def cast_community_vote(
         await callback.answer()
 
 
-async def _answer_release_contact(
+async def _show_release_contact_button(
     *,
     callback: CallbackQuery,
+    bot: Bot,
     punishment_id: int,
+    chat_id: int,
+    message_id: int,
     admin_id: int,
     admin_username: str | None,
 ) -> None:
@@ -129,69 +129,20 @@ async def _answer_release_contact(
         },
     )
     if admin_username:
-        await callback.answer(url=f"https://t.me/{admin_username}")
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=CONTACT_ADMIN_BUTTON_TEXT,
+                            url=f"https://t.me/{admin_username}",
+                        )
+                    ]
+                ]
+            ),
+        )
+        await callback.answer()
         return
     await callback.answer(TEXTS.admin_contact_unavailable, show_alert=True)
-
-
-async def _answer_release_url(
-    *,
-    callback: CallbackQuery,
-    bot: Bot,
-    punishment_id: int,
-    url: str | None,
-) -> None:
-    """Answer only with Bot API-supported callback redirect URLs."""
-
-    logger.info(
-        "release_callback_url_requested",
-        extra={"punishment_id": punishment_id, "result_url": url},
-    )
-    try:
-        bot_username = (await bot.get_me()).username
-    except TelegramAPIError:
-        logger.warning(
-            "release_callback_url_bot_identity_unavailable",
-            extra={"punishment_id": punishment_id, "result_url": url},
-            exc_info=True,
-        )
-        await callback.answer()
-        return
-
-    if not _is_bot_start_url(url=url, bot_username=bot_username):
-        logger.warning(
-            "release_callback_url_rejected",
-            extra={
-                "punishment_id": punishment_id,
-                "result_url": url,
-                "bot_username": bot_username,
-            },
-        )
-        await callback.answer()
-        return
-
-    try:
-        await callback.answer(url=url)
-    except TelegramBadRequest:
-        logger.warning(
-            "release_callback_url_telegram_rejected",
-            extra={"punishment_id": punishment_id, "result_url": url},
-            exc_info=True,
-        )
-        await callback.answer()
-
-
-def _is_bot_start_url(*, url: str | None, bot_username: str | None) -> bool:
-    """Return whether *url* is a supported deep link for this bot."""
-
-    if not url or not bot_username:
-        return False
-
-    parsed = urlparse(url)
-    if parsed.scheme != "https" or parsed.netloc.casefold() != "t.me":
-        return False
-    if parsed.path.strip("/").casefold() != bot_username.casefold():
-        return False
-
-    start_values = parse_qs(parsed.query).get("start", [])
-    return any(start_values)

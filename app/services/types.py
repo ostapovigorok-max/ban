@@ -21,11 +21,9 @@ class ModerationRequest:
 class CallbackResultKind(StrEnum):
     ANSWER = "ANSWER"
     ALERT = "ALERT"
-    URL = "URL"
 
 
 @dataclass(frozen=True, slots=True)
 class CallbackResult:
     kind: CallbackResultKind
     text: str | None = None
-    url: str | None = None
